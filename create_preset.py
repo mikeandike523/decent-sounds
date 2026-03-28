@@ -35,11 +35,14 @@ Enhancement:
 """
 
 import argparse
+import math
 import os
 import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
+
+from termcolor import colored
 
 
 # ---------------------------
@@ -70,7 +73,7 @@ def parse_root_note(root: str) -> int:
       - a note name like "C4", "A#3", "Db2"
 
     Returns:
-        MIDI note number (0–127).
+        MIDI note number (0-127).
 
     Raises:
         ValueError if the format is invalid or out of range.
@@ -81,7 +84,7 @@ def parse_root_note(root: str) -> int:
     try:
         midi = int(root)
         if not (0 <= midi <= 127):
-            raise ValueError(f"MIDI note {midi} out of range (0–127)")
+            raise ValueError(f"MIDI note {midi} out of range (0-127)")
         return midi
     except ValueError:
         pass  # Not a plain int; fall through to note-name parsing
@@ -110,10 +113,109 @@ def parse_root_note(root: str) -> int:
 
     if not (0 <= midi <= 127):
         raise ValueError(
-            f"Resulting MIDI note {midi} from '{root}' out of range (0–127)"
+            f"Resulting MIDI note {midi} from '{root}' out of range (0-127)"
         )
 
     return midi
+
+
+# ---------------------------
+# Pitch estimation
+# ---------------------------
+
+SEMITONE_TO_NOTE = [
+    "C", "C#", "D", "D#", "E", "F",
+    "F#", "G", "G#", "A", "A#", "B",
+]
+
+
+def midi_to_note_name(midi: int) -> str:
+    """Return a note name like 'C4' for a MIDI number."""
+    octave = (midi // 12) - 1
+    name = SEMITONE_TO_NOTE[midi % 12]
+    return f"{name}{octave}"
+
+
+def hz_to_midi_float(hz: float) -> float:
+    """Convert Hz to a (possibly fractional) MIDI note number."""
+    if hz <= 0:
+        raise ValueError("Frequency must be positive")
+    return 12.0 * math.log2(hz / 440.0) + 69.0
+
+
+def estimate_fundamental_hz(wav_path: str) -> float | None:
+    """
+    Estimate the fundamental frequency of a WAV file using librosa's
+    probabilistic YIN (pyin) algorithm.
+
+    Returns the median voiced-frame fundamental in Hz, or None if no
+    voiced frames were detected.
+    """
+    try:
+        import librosa
+        import numpy as np
+    except ImportError:
+        raise ImportError(
+            "librosa is required for pitch estimation. "
+            "Run: pip install librosa"
+        )
+
+    y, sr = librosa.load(wav_path, sr=None, mono=True)
+
+    f0, voiced_flag, _ = librosa.pyin(
+        y,
+        fmin=float(librosa.note_to_hz("C2")),
+        fmax=float(librosa.note_to_hz("C8")),
+        sr=sr,
+    )
+
+    voiced_f0 = f0[voiced_flag]
+    if len(voiced_f0) == 0:
+        return None
+
+    return float(np.median(voiced_f0))
+
+
+def print_pitch_estimate(hz: float, mode: str) -> None:
+    """Print a coloured pitch-estimate report to stdout."""
+    midi_float = hz_to_midi_float(hz)
+    midi_int = round(midi_float)
+    midi_int = max(0, min(127, midi_int))
+    cents_off = (midi_float - midi_int) * 100.0
+    note_name = midi_to_note_name(midi_int)
+
+    print(colored("-" * 50, "cyan"))
+    print(colored("  Pitch Estimation Results", "cyan", attrs=["bold"]))
+    print(colored("-" * 50, "cyan"))
+    print(
+        "  Estimated fundamental: "
+        + colored(f"{hz:.3f} Hz", "yellow", attrs=["bold"])
+    )
+
+    if mode == "12edo":
+        print(
+            "  Nearest 12-EDO note:   "
+            + colored(f"{note_name}  (MIDI {midi_int})", "green", attrs=["bold"])
+            + colored(f"  [{cents_off:+.1f} cents]", "white")
+        )
+        print(colored("-" * 50, "cyan"))
+    else:  # pure_hz
+        print(
+            "  Nearest 12-EDO note:   "
+            + colored(f"{note_name}  (MIDI {midi_int})", "white")
+            + colored(f"  [{cents_off:+.1f} cents]", "white")
+        )
+        print(
+            "  rootNote (Hz):         "
+            + colored(f"{hz:.4f}", "magenta", attrs=["bold"])
+            + colored(
+                "  ! DecentSampler rootNote expects an integer MIDI value "
+                "(0-127); writing Hz here is non-standard and may be ignored "
+                "or misinterpreted by the player.",
+                "red",
+            )
+        )
+        print(colored("-" * 50, "cyan"))
 
 
 # ---------------------------
@@ -121,7 +223,11 @@ def parse_root_note(root: str) -> int:
 # ---------------------------
 
 
-def create_decent_sampler_preset(sample_path: str, root_note: int = 60) -> str:
+def create_decent_sampler_preset(
+    sample_path: str,
+    root_note: int = 60,
+    root_note_raw: str | None = None,
+) -> str:
     """
     Create a Decent Sampler .dspreset file for a single sample with
     visible ADSR knobs in the UI.
@@ -129,6 +235,8 @@ def create_decent_sampler_preset(sample_path: str, root_note: int = 60) -> str:
     :param sample_path: Path to the WAV sample file (in the output folder).
     :param root_note: MIDI note number that represents the sample's original
                       pitch.
+    :param root_note_raw: If provided, written verbatim as the rootNote
+                          attribute (e.g. a Hz string for --estimate-pure-hz).
     :return: Path to the created .dspreset file.
     """
     # Ensure sample exists
@@ -145,7 +253,7 @@ def create_decent_sampler_preset(sample_path: str, root_note: int = 60) -> str:
     preset_filename = base_name + ".dspreset"
     preset_path = os.path.join(sample_dir, preset_filename)
 
-    # --- ADSR defaults (seconds, sustain 0–1) -----------------------
+    # --- ADSR defaults (seconds, sustain 0-1) -----------------------
     attack_default = 0.005
     decay_default = 0.5
     sustain_default = 1.0
@@ -154,7 +262,7 @@ def create_decent_sampler_preset(sample_path: str, root_note: int = 60) -> str:
 
     # Build XML structure
     root = ET.Element("DecentSampler")
-    # (optional but nice) – require a reasonably recent version:
+    # (optional but nice) - require a reasonably recent version:
     # root.set("minVersion", "1.13.3")
 
     # UI with a single tab
@@ -255,7 +363,7 @@ def create_decent_sampler_preset(sample_path: str, root_note: int = 60) -> str:
 
     sample_elem = ET.SubElement(group, "sample")
     sample_elem.set("path", sample_filename)  # relative
-    sample_elem.set("rootNote", str(root_note))
+    sample_elem.set("rootNote", root_note_raw if root_note_raw is not None else str(root_note))
     sample_elem.set("loNote", "0")
     sample_elem.set("hiNote", "127")
 
@@ -299,8 +407,30 @@ def main():
         default="60",
         help="Root note as MIDI number or note name (default: 60 / C4).",
     )
+    parser.add_argument(
+        "--estimate-root-note-12-edo",
+        action="store_true",
+        help=(
+            "Estimate the root note from the audio and round to the nearest "
+            "12-EDO MIDI note. Overrides --root."
+        ),
+    )
+    parser.add_argument(
+        "--estimate-pure-hz",
+        action="store_true",
+        help=(
+            "Estimate the root note from the audio and write the raw Hz value "
+            "as rootNote in the preset. "
+            "Note: DecentSampler rootNote expects an integer MIDI value; "
+            "this is non-standard and may not be supported by the player."
+        ),
+    )
 
     args = parser.parse_args()
+
+    if args.estimate_root_note_12_edo and args.estimate_pure_hz:
+        print(colored("Error: --estimate-root-note-12-edo and --estimate-pure-hz are mutually exclusive.", "red"))
+        return
 
     try:
         root_midi = parse_root_note(args.root)
@@ -380,10 +510,42 @@ def main():
                 # on a file already inside output_files, but we keep it safe.
                 print("Input WAV already in the desired output location.")
 
-        # Now create the preset using the WAV that lives in the output folder.
-        preset_path = create_decent_sampler_preset(wav_path, root_midi)
+        # Optionally estimate root note from the audio.
+        root_note_raw = None
+        if args.estimate_root_note_12_edo or args.estimate_pure_hz:
+            print(colored("Estimating fundamental frequency...", "cyan"))
+            hz = estimate_fundamental_hz(wav_path)
+            if hz is None:
+                print(colored(
+                    "Warning: no voiced frames detected; falling back to --root value.",
+                    "yellow",
+                ))
+            else:
+                mode = "12edo" if args.estimate_root_note_12_edo else "pure_hz"
+                print_pitch_estimate(hz, mode)
+                if args.estimate_root_note_12_edo:
+                    midi_float = hz_to_midi_float(hz)
+                    root_midi = max(0, min(127, round(midi_float)))
+                else:  # pure_hz
+                    root_note_raw = f"{hz:.4f}"
 
-        print(f"Parsed root note '{args.root}' -> MIDI {root_midi}")
+        # Now create the preset using the WAV that lives in the output folder.
+        preset_path = create_decent_sampler_preset(wav_path, root_midi, root_note_raw)
+
+        if args.estimate_root_note_12_edo:
+            note_str = midi_to_note_name(root_midi)
+            print(colored(
+                f"Using estimated root note: {note_str} (MIDI {root_midi})",
+                "green", attrs=["bold"],
+            ))
+        elif args.estimate_pure_hz:
+            print(colored(
+                f"Using estimated root note (Hz): {root_note_raw}  "
+                "[non-standard - see warning above]",
+                "magenta", attrs=["bold"],
+            ))
+        else:
+            print(f"Parsed root note '{args.root}' -> MIDI {root_midi}")
         print(f"Created Decent Sampler preset with ADSR UI controls:\n  {preset_path}")
         print("Associated WAV sample:\n  " + wav_path)
         print("\nNow in Decent Sampler:")

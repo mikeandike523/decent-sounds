@@ -5,3 +5,5 @@
 input_files
 output_files
 
+# Ignore potentially sensitive settings and memory
+.claude
